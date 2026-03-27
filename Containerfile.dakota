@@ -1,0 +1,71 @@
+# Containerfile.dakota — ThinkPad X13s hardware support on projectbluefin/dakota.
+#
+# dakota is GNOME OS (BuildStream) based — no dnf, rpm-ostree, or apt.
+# Strategy: multi-stage build using Fedora to install X13s packages, then
+# COPY the relevant binaries and firmware into the dakota image.
+#
+# Build:
+#   podman build -f Containerfile.dakota -t localhost/dakota-x13s:latest .
+#
+# TODO: GNOME OS uses a UKI (Unified Kernel Image) with the initramfs embedded.
+#   Battery monitor firmware (qcadsp8280.mbn.xz etc.) must be in the initramfs.
+#   On Fedora images this is handled by dracut.conf.d + dracut -f at build time.
+#   On dakota, investigate whether bootc triggers a UKI/initramfs rebuild on
+#   upgrade and how to inject firmware (ukify --initrd? dracut.conf.d hook?).
+#   In the meantime, firmware is copied to /usr/lib/firmware so the running
+#   kernel can load it — but the battery monitor may not work until this is
+#   resolved.
+
+ARG DAKOTA_VERSION=latest
+
+# ── Stage 1: Extract X13s packages via Fedora ────────────────────────────────
+FROM fedora:latest AS x13s-stage
+
+RUN dnf -y copr enable jlinton/x13s && \
+    dnf -y install x13s pd-mapper qcom-firmware && \
+    dnf clean all
+
+# ── Stage 2: Layer X13s support onto dakota (GNOME OS) ───────────────────────
+FROM ghcr.io/projectbluefin/dakota:${DAKOTA_VERSION}
+
+# --- Kernel arguments (required for X13s / Qualcomm SC8280XP stability) ---
+COPY --chmod=644 <<EOF /usr/lib/bootc/kargs.d/01-x13s.toml
+[kargs]
+kargs = [
+    "arm64.nopauth",
+    "clk_ignore_unused",
+    "pd_ignore_unused",
+    "modprobe.blacklist=qcom_q6v5_pas",
+    "efi=noruntime",
+    "devicetree=/dtb/qcom/sc8280xp-lenovo-thinkpad-x13s.dtb",
+]
+EOF
+
+# --- pd-mapper: Qualcomm power domain manager ---
+COPY --from=x13s-stage /usr/bin/pd-mapper /usr/bin/pd-mapper
+COPY --from=x13s-stage /usr/lib/systemd/system/pd-mapper.service \
+                        /usr/lib/systemd/system/pd-mapper.service
+
+# qrtr socket (required by pd-mapper)
+COPY --from=x13s-stage /usr/bin/qrtr-ns /usr/bin/qrtr-ns
+COPY --from=x13s-stage /usr/lib/systemd/system/qrtr-ns.service \
+                        /usr/lib/systemd/system/qrtr-ns.service
+COPY --from=x13s-stage /usr/lib/udev/rules.d/ /usr/lib/udev/rules.d/
+
+# --- Qualcomm firmware ---
+COPY --from=x13s-stage /usr/lib/firmware/qcom/ /usr/lib/firmware/qcom/
+
+# --- Enable pd-mapper via systemd preset ---
+COPY x13s_repo/75-x13s.preset /usr/lib/systemd/system-preset/75-x13s.preset
+
+# --- Bluetooth: persistent random MAC (X13s has no factory BT address) ---
+COPY x13s_repo/override.conf /etc/systemd/system/bluetooth.service.d/override.conf
+RUN sed -i \
+    "s/XX/$(printf "%2.2X" $((RANDOM%256)))/g; \
+     s/YY/$(printf "%2.2X" $((RANDOM%256)))/g; \
+     s/ZZ/$(printf "%2.2X" $((RANDOM%256)))/g" \
+    /etc/systemd/system/bluetooth.service.d/override.conf
+
+# --- Dracut config: firmware in initramfs (battery monitor) ---
+# TODO: May have no effect on dakota (GNOME OS UKI initramfs). See note above.
+COPY x13s_repo/x13s.conf /etc/dracut.conf.d/x13s.conf
